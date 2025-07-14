@@ -1,0 +1,16 @@
+[tool.poetry]
+name = "nbagents"
+version = "0.1.0"
+description = "A nano, minimalistic, and lightweight library for building ReACT-based AI agents that use tools to solve tasks."
+authors = ["NavuluriBalaji <navuluribalaji03@gmail.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.8"
+requests = "^2.31.0"
+aiohttp = "^3.9.0"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
