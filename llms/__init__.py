@@ -283,4 +283,68 @@ class OpenRouterLLM(BaseLLM):
         except Exception:
             return False
 
-__all__ = ["BaseLLM", "OllamaLLM", "OpenAILLM", "AnthropicLLM", "OpenRouterLLM"]
+class GeminiLLM(BaseLLM):
+    """Google Gemini API Provider."""
+    
+    def __init__(self, model: str = "gemini-2.5-flash", temperature: float = 0.7, max_tokens: int = 4096, api_key: Optional[str] = None):
+        self.model = model
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.api_key = api_key or os.environ.get("GEMINI_API_KEY")
+        if not self.api_key:
+            raise ValueError("api_key must be provided directly or via GEMINI_API_KEY")
+
+    def complete(self, prompt: str) -> str:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={self.api_key}"
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": self.temperature,
+                "maxOutputTokens": self.max_tokens
+            }
+        }
+        req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'))
+        req.add_header('Content-Type', 'application/json')
+        
+        try:
+            with urllib.request.urlopen(req, timeout=30) as response:
+                data = json.loads(response.read().decode())
+                return data["candidates"][0]["content"]["parts"][0].get("text", "")
+        except Exception as e:
+            raise RuntimeError(f"Gemini complete failed: {e}")
+
+    def stream(self, prompt: str) -> Iterator[str]:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:streamGenerateContent?alt=sse&key={self.api_key}"
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": self.temperature,
+                "maxOutputTokens": self.max_tokens
+            }
+        }
+        req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'))
+        req.add_header('Content-Type', 'application/json')
+        
+        try:
+            with urllib.request.urlopen(req, timeout=30) as response:
+                for line in response:
+                    line = line.decode().strip()
+                    if line.startswith("data: "):
+                        data = json.loads(line[6:])
+                        if "candidates" in data and len(data["candidates"]) > 0:
+                            parts = data["candidates"][0]["content"].get("parts", [])
+                            if parts:
+                                yield parts[0].get("text", "")
+        except Exception as e:
+            raise RuntimeError(f"Gemini stream failed: {e}")
+
+    def health_check(self) -> bool:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={self.api_key}"
+        req = urllib.request.Request(url)
+        try:
+            with urllib.request.urlopen(req, timeout=5) as response:
+                return response.status == 200
+        except Exception:
+            return False
+
+__all__ = ["BaseLLM", "OllamaLLM", "OpenAILLM", "AnthropicLLM", "OpenRouterLLM", "GeminiLLM"]

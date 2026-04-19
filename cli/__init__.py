@@ -19,7 +19,7 @@ from typing import Optional
 
 # Internal imports
 from NKit.agent.core import Agent
-from NKit.llms import OllamaLLM, OpenAILLM, AnthropicLLM, OpenRouterLLM
+from NKit.llms import OllamaLLM, OpenAILLM, AnthropicLLM, OpenRouterLLM, GeminiLLM
 from NKit.observer import LiveObserver
 from NKit.audit import WhyLog
 from NKit.tools import ToolRegistry
@@ -40,6 +40,8 @@ def resolve_llm(model_tuple: str):
         return AnthropicLLM(model=model)
     elif provider == "openrouter":
         return OpenRouterLLM(model=model)
+    elif provider == "gemini":
+        return GeminiLLM(model=model)
     else:
         raise ValueError(f"Unknown provider: {provider}")
 
