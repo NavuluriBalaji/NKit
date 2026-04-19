@@ -1,244 +1,113 @@
-# NKit Agentic Framework
+# NKit — Production Safety Layer for Agentic AI
 
-**Production-ready agent framework with plugin architecture, SOLID principles, and comprehensive security.**
+> **Live observability, pre-execution safety, and audit trails for any agent framework.**
 
-## Features
+NKit is a nano, minimalistic, production-ready framework for building ReAct agents, or wrapping your existing ones. It focuses natively on ensuring that agents are safe, compliant, and observable *before* they execute destructive actions, solving the biggest blockers to enterprise AI adoption.
 
-- ✅ **Plugin & Play**: Swap memory, retrieval, prompts without code changes
-- ✅ **RAG Support**: Built-in retrieval systems for context-augmented agents
-- ✅ **Security First**: Input validation, path sanitization, resource limits
-- ✅ **SOLID Design**: Dependency injection, interface-based extensibility
-- ✅ **Graph Orchestration**: LangGraph-style DAG execution with conditional routing
-- ✅ **Multi-Agent**: CrewAI-style orchestration for agent teams
-- ✅ **Async/Sync**: Seamless handling of sync and async functions
-- ✅ **Comprehensive Docs**: Every function explains WHY and HOW to reuse
+---
 
-## Quick Start
+## 🛑 Why NKit? (The Missing Safety Layer)
+Most agent frameworks focus on chaining together LLM queries but treat production safety as an afterthought. NKit was built specifically to solve three critical problems:
 
-### Basic Agent
+1. **Pre-Execution Intent Verification:** Other frameworks let tools run immediately. NKit's `SafetyGate` pauses and evaluates an agent's intent *before* execution, blocking misaligned goals or destructive actions automatically (with an optional HITL fallback).
+2. **The `Why Log`:** Classic logging tells you "Agent executed query `DROP TABLE users`". NKit's `WhyLog` creates a structured JSONL audit trail capturing the exact chain of thought that led to that hallucinated conclusion.
+3. **Live Decision Streaming:** NKit ditches post-mortem log scraping in favor of a real-time event bus (`LiveObserver`), allowing developers and compliance teams to monitor decisions *live*.
 
-```python
-from nkit import Agent
+---
 
-def my_llm(prompt: str) -> str:
-    # Your LLM API call here
-    return llm_response
-
-agent = Agent(llm=my_llm)
-result = agent.run("What is the capital of France?")
-print(result)
-```
-
-### RAG-Enabled Agent
+## ⚡ Quick Start
 
 ```python
-from nkit import Agent
-from nkit.retrieval import InMemoryRetriever
-from nkit.memory import JSONFileMemory
+from nkit.agent import Agent
+from nkit.llms import OllamaLLM
+from nkit.observer import LiveObserver
 
-# Setup knowledge base
-retriever = InMemoryRetriever()
-retriever.add_documents([
-    {"content": "Paris is the capital of France", "metadata": {"source": "geo.txt"}},
-])
+# 1. Start live observer
+observer = LiveObserver()
 
-# Custom prompt service with RAG
-from nkit.prompt import ReActPromptService
+@observer.on("tool.before")
+def watch_intent(e):
+    print(f"Agent attempting {e['tool_name']} because: {e['why']}")
 
-class RAGPromptService(ReActPromptService):
-    def __init__(self, retriever, **kwargs):
-        super().__init__(**kwargs)
-        self.retriever = retriever
-    
-    def build_agent_prompt(self, task, tools, history, memory=None):
-        docs = self.retriever.retrieve(task, top_k=3)
-        context = "\n".join([d["content"] for d in docs])
-        base = super().build_agent_prompt(task, tools, history, memory)
-        return f"Context:\n{context}\n\n{base}"
+# 2. Hook up local LLM
+llm = OllamaLLM(model="llama3")
 
-# Create agent with plugins
-agent = Agent(
-    llm=my_llm,
-    memory=JSONFileMemory("./session.json"),
-    prompt_service=RAGPromptService(retriever)
-)
-
-result = agent.run("What is the capital of France?")
+# 3. Mount and run
+agent = Agent(llm=llm.complete, observer=observer)
+agent.run("Summarize the current market trends")
 ```
 
-### Graph Orchestration
+---
 
-```python
-from nkit.chain import Graph, Node, State
+## 🏗 Core Concepts
 
-def plan(state: State):
-    return {"plan": ["analyze", "summarize"]}
+* **Observer (`nkit.observer`)**: Intercepts the core ReAct loop allowing developers to use asynchronous `@observer.on()` listeners to monitor the start, thoughts, tool pre-execution, and results of actions dynamically.
+* **SafetyGate (`nkit.safety`)**: Pre-execution middleware that heuristically and conditionally blocks path-escapes, destructive keywords, and untrained domain accesses. Supports HITL (Human-in-the-loop) approvals.
+* **WhyLog (`nkit.audit`)**: Extensively formats the trace-history into a rotating 10MB `audit.jsonl` log file, embedding the thought-process behind every single external action.
 
-def execute(state: State):
-    plan = state.get("plan")
-    return f"Executed: {plan}"
+---
 
-g = Graph()
-g.add_node(Node("plan", plan)).add_node(Node("exec", execute))
-g.add_edge("plan", "exec")
+## 🧠 Supported LLM Providers
 
-final = g.run(State())
-print(final.last_result)
+NKit provides pure, bloat-free `urllib`-based LLM adapters ensuring you aren't dragging in multi-megabyte SDKs just to query an API:
+
+* `OllamaLLM`: Calls localhost (llama3, phi3, mistral).
+* `OpenAILLM`: Calls OpenAI (gpt-4o) with native exponential backoff.
+* `AnthropicLLM`: Calls Anthropic (claude-3-opus).
+* `OpenRouterLLM`: Universal model passthrough to api.openrouter.ai.
+
+---
+
+## 📚 Examples
+Explore the `/examples` directory to see NKit in action:
+
+1. **`local_agent.py`**: A fully local agent using Ollama and the WhyLog.
+2. **`safe_file_agent.py`**: Demonstrates the SafetyGate isolating an agent within a sandbox.
+3. **`multi_agent_research.py`**: Multi-agent task orchestration tracked via Observer.
+4. **`enterprise_audit_demo.py`**: An enterprise use-case mimicking a logistics compliance workflow.
+5. **`framework_wrapper_demo.py`**: Wraps a mock LangChain agent into the NKit LiveObserver to prove interoperability.
+
+---
+
+## ✅ Production Checklist
+Out of the box, NKit provides:
+- [x] Pre-Execution Safety Interceptors & Human-in-The-Loop.
+- [x] Asynchronous real-time observation streaming.
+- [x] Centralized, stateful Audit Logging (`WhyLogs`).
+- [x] Hard bounds on executions: 30s Tool Timeouts, 10KB Result Sizing, Max Retries limiting.
+- [x] Security-principled path sandboxing and String parsing.
+
+---
+
+## 🗺 Architecture
+
+```text
+ ┌─────────────────┐       ┌─────────────────┐       ┌─────────────────┐
+ │   User Prompt   │ ────▶ │  Agent / Crew   │ ────▶ │   LLM Adapter   │
+ └─────────────────┘       └─────────────────┘       └─────────────────┘
+                                   │
+                                   ▼
+                         ┌─────────────────┐ (Triggers agent.reasoning)
+                         │  Live Observer  │
+                         └─────────────────┘
+                                   │
+                                   ▼
+                         ┌─────────────────┐ (Evaluates Risk & HITL)
+                         │   Safety Gate   │
+                         └─────────────────┘
+                                   │
+                                   ▼
+                         ┌─────────────────┐ (Logs the "Why")
+                         │     WhyLog      │
+                         └─────────────────┘
+                                   │
+                                   ▼
+                         ┌─────────────────┐ (Timeout bounds & limits)
+                         │ Tool Execution  │
+                         └─────────────────┘
 ```
 
-### Custom Tools with Security
+---
 
-```python
-from nkit import Agent
-from nkit.security import PathValidator, ToolInputValidator
-
-# Path validation
-path_val = PathValidator(allowed_dirs=["./data"])
-
-@agent.tool("safe_read", "Read file safely")
-def read_file(file_path: str) -> str:
-    validated = path_val.validate_path(file_path)
-    with open(validated, 'r') as f:
-        return f.read()
-```
-
-## Architecture Overview
-
-```
-nkit/
-├── nbagents.py           # Core Agent with ReAct reasoning
-├── interfaces.py         # Abstract interfaces (MemoryStore, PromptService, etc.)
-├── memory/               # Memory backends (Memory, JSONFileMemory)
-├── prompt.py             # Prompt services (ReActPromptService, PromptTemplate)
-├── tools/                # Tool system (Tool, ToolRegistry, BuiltinTools)
-├── retrieval.py          # RAG retrievers (InMemoryRetriever, JSONDocumentRetriever)
-├── security.py           # Input validators (PathValidator, StringValidator)
-├── chain/                # Graph orchestration (Graph, Node, Edge, State)
-├── agents/               # Multi-agent coordination (MultiAgentOrchestrator)
-└── examples/             # Runnable demos
-```
-
-See [ARCHITECTURE.md](ARCHITECTURE.md) for comprehensive design documentation.
-
-## SOLID Principles
-
-### Single Responsibility
-- `Agent`: Orchestration only
-- `PromptService`: Prompt construction
-- `ResponseParser`: Output parsing
-- `ToolRegistry`: Tool management
-
-### Open/Closed
-- Extend via plugins (tools, memory, prompts)
-- No core modification needed
-
-### Liskov Substitution
-- Swap any `MemoryStore` implementation
-- Swap any `PromptService` implementation
-
-### Interface Segregation
-- Small, focused interfaces
-- Implement only what you need
-
-### Dependency Inversion
-- `Agent` depends on abstractions (protocols/ABCs)
-- Inject dependencies via constructor
-
-## Security Features
-
-- **Input Validation**: Path traversal prevention, character whitelisting
-- **Resource Limits**: Max steps, retries, memory size, history length
-- **Injection Prevention**: Key validation, prompt sanitization, JSON depth limits
-- **Least Privilege**: Directory whitelisting, no shell execution by default
-
-Example:
-```python
-from nkit.security import PathValidator
-
-validator = PathValidator(allowed_dirs=["/data"])
-safe_path = validator.validate_path("/data/file.txt")  # OK
-validator.validate_path("/etc/passwd")  # raises ValueError
-```
-
-## Plugin Development
-
-### Custom Memory Backend
-
-```python
-from nkit.interfaces import MemoryStore
-
-class RedisMemory:
-    def get(self, key, default=None): ...
-    def set(self, key, value): ...
-    # Implement protocol methods
-
-agent = Agent(llm=my_llm, memory=RedisMemory("redis://localhost"))
-```
-
-### Custom Retrieval System
-
-```python
-from nkit.interfaces import RetrievalSystem
-
-class VectorDBRetriever:
-    def retrieve(self, query, top_k=5, filters=None): ...
-    def add_documents(self, documents): ...
-
-retriever = VectorDBRetriever(index="my-index")
-prompt_service = RAGPromptService(retriever)
-agent = Agent(llm=my_llm, prompt_service=prompt_service)
-```
-
-## Examples
-
-```bash
-# Basic graph demo
-python nkit/examples/demo_graph.py
-
-# RAG agent with persistent memory
-python nkit/examples/demo_rag_agent.py
-```
-
-## Requirements
-
-- Python 3.10+
-- Optional: `requests`, `aiohttp` for built-in web search tools
-
-```bash
-pip install requests aiohttp
-```
-
-## Documentation
-
-- [ARCHITECTURE.md](ARCHITECTURE.md): Complete design documentation
-- [interfaces.py](interfaces.py): Interface definitions with usage examples
-- [security.py](security.py): Security validators and best practices
-
-Every module includes comprehensive docstrings explaining:
-- **Purpose**: What the component does
-- **Reuse Patterns**: How to use in different scenarios
-- **Security**: What to watch out for
-- **Examples**: Working code snippets
-
-## Why This Design?
-
-**Problem:**  
-"I want to plug and play a RAG system, or add a memory layer, with clean, secure, refactored code."
-
-**Solution:**  
-1. **Plugin Architecture**: Inject any component via constructor
-2. **Interface-Based**: Swap implementations without code changes
-3. **Security Built-In**: Validators, sanitizers, resource limits
-4. **SOLID Compliance**: Each component has one job, easily extensible
-5. **Comprehensive Docs**: Every function explains WHY and HOW
-
-**Result:**  
-You can build a RAG Q&A agent with persistent memory and custom tools in ~20 lines, then swap to a vector DB and Redis backend by changing 2 parameters.
-
-## License
-
-MIT
-
-## Contributing
-
-Issues and PRs welcome! See [ARCHITECTURE.md](ARCHITECTURE.md) for design guidelines.
+## 🤝 Contributing
+NKit adheres strictly to SOLID design principles. No single module should become a God class. Features must be injected as plugins via interfaces. If extending NKit, remember its north star: **Security, safety, and observability above all else.** Pull requests are welcome!

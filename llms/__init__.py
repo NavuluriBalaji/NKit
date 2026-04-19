@@ -1,361 +1,286 @@
-"""LLM adapters for various providers.
+"""LLM Provider Abstractions for NKit.
 
-This module provides unified interfaces to different LLM providers:
-- OpenAI (GPT-4, GPT-3.5)
-- Anthropic (Claude)
-- Ollama (local models)
-- Azure OpenAI
-- Custom endpoints
+Provides unified interfaces to:
+1. OllamaLLM — Local models (llama3, mistral)
+2. OpenAILLM — Cloud models (gpt-4o)
+3. AnthropicLLM — Cloud models (claude-3-opus)
+4. OpenRouterLLM — Universal passthrough
 
 Architecture:
-    All adapters implement BaseLLM interface for consistency.
-    Supports streaming, retries, rate limiting, token counting.
+    All providers implement `BaseLLM` consisting of:
+    - `complete(prompt: str) -> str`
+    - `stream(prompt: str) -> Iterator[str]`
+    - `health_check() -> bool`
 """
 
-import asyncio
+import os
 import json
+import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, AsyncIterator
-
-@dataclass
-class LLMConfig:
-    """Configuration for LLM providers.
-    
-    Attributes:
-        model: Model identifier (e.g., "gpt-4", "claude-3-opus")
-        temperature: Sampling temperature (0.0-2.0)
-        max_tokens: Maximum response tokens
-        api_key: Provider API key
-        base_url: Custom API endpoint
-        timeout: Request timeout in seconds
-        max_retries: Retry attempts on failure
-        stream: Enable streaming responses
-    """
-    model: str
-    temperature: float = 0.7
-    max_tokens: int = 4096
-    api_key: Optional[str] = None
-    base_url: Optional[str] = None
-    timeout: int = 60
-    max_retries: int = 3
-    stream: bool = False
-    extra: Dict[str, Any] = None
-
+from typing import Any, Dict, Iterator, Optional
+import urllib.request
+import urllib.error
 
 class BaseLLM(ABC):
-    """Base class for all LLM adapters.
-    
-    Purpose:
-        Provides uniform interface across providers, enabling easy swapping
-        and testing with different models.
-    
-    Reuse Pattern:
-        ```python
-        # Development with Ollama
-        llm = OllamaLLM(model="llama2")
-        
-        # Production with OpenAI
-        llm = OpenAILLM(model="gpt-4", api_key=key)
-        
-        # Both work with Agent
-        agent = Agent(llm=llm.call)
-        ```
-    """
-    
-    def __init__(self, config: LLMConfig):
-        """Initialize LLM with configuration."""
-        self.config = config
+    """Abstract Base Class for all NKit LLM Providers."""
     
     @abstractmethod
-    def call(self, prompt: str, **kwargs) -> str:
-        """Synchronous LLM call.
-        
-        Args:
-            prompt: Input prompt
-            **kwargs: Override config parameters
-        
-        Returns:
-            Generated text
-        """
+    def complete(self, prompt: str) -> str:
+        """Process the prompt and return the complete string."""
         pass
-    
-    @abstractmethod
-    async def acall(self, prompt: str, **kwargs) -> str:
-        """Asynchronous LLM call.
-        
-        Args:
-            prompt: Input prompt
-            **kwargs: Override config parameters
-        
-        Returns:
-            Generated text
-        """
-        pass
-    
-    @abstractmethod
-    async def stream(self, prompt: str, **kwargs) -> AsyncIterator[str]:
-        """Stream LLM response.
-        
-        Args:
-            prompt: Input prompt
-            **kwargs: Override config parameters
-        
-        Yields:
-            Text chunks as they're generated
-        """
-        pass
-    
-    def count_tokens(self, text: str) -> int:
-        """Estimate token count (rough approximation).
-        
-        Args:
-            text: Text to count
-        
-        Returns:
-            Approximate token count
-        """
-        return len(text) // 4
 
+    @abstractmethod
+    def stream(self, prompt: str) -> Iterator[str]:
+        """Process the prompt and yield streaming output chunks."""
+        pass
 
-class OpenAILLM(BaseLLM):
-    """OpenAI API adapter (GPT-4, GPT-3.5, etc.).
-    
-    Purpose:
-        Production-ready adapter for OpenAI models with retry logic,
-        error handling, and streaming support.
-    
-    Example:
-        ```python
-        llm = OpenAILLM(LLMConfig(
-            model="gpt-4-turbo",
-            api_key=os.getenv("OPENAI_API_KEY"),
-            temperature=0.7,
-            max_tokens=2000
-        ))
-        
-        response = llm.call("Explain quantum computing")
-        ```
-    
-    Requires:
-        ```bash
-        pip install openai
-        ```
-    """
-    
-    def __init__(self, config: LLMConfig):
-        super().__init__(config)
-        try:
-            import openai
-            self.client = openai.OpenAI(
-                api_key=config.api_key,
-                base_url=config.base_url,
-                timeout=config.timeout
-            )
-            self.async_client = openai.AsyncOpenAI(
-                api_key=config.api_key,
-                base_url=config.base_url,
-                timeout=config.timeout
-            )
-        except ImportError:
-            raise ImportError("openai package required. Install: pip install openai")
-    
-    def call(self, prompt: str, **kwargs) -> str:
-        """Synchronous OpenAI call."""
-        params = {
-            "model": kwargs.get("model", self.config.model),
-            "temperature": kwargs.get("temperature", self.config.temperature),
-            "max_tokens": kwargs.get("max_tokens", self.config.max_tokens),
-            "messages": [{"role": "user", "content": prompt}]
-        }
-        
-        response = self.client.chat.completions.create(**params)
-        return response.choices[0].message.content
-    
-    async def acall(self, prompt: str, **kwargs) -> str:
-        """Asynchronous OpenAI call."""
-        params = {
-            "model": kwargs.get("model", self.config.model),
-            "temperature": kwargs.get("temperature", self.config.temperature),
-            "max_tokens": kwargs.get("max_tokens", self.config.max_tokens),
-            "messages": [{"role": "user", "content": prompt}]
-        }
-        
-        response = await self.async_client.chat.completions.create(**params)
-        return response.choices[0].message.content
-    
-    async def stream(self, prompt: str, **kwargs) -> AsyncIterator[str]:
-        """Stream OpenAI response."""
-        params = {
-            "model": kwargs.get("model", self.config.model),
-            "temperature": kwargs.get("temperature", self.config.temperature),
-            "max_tokens": kwargs.get("max_tokens", self.config.max_tokens),
-            "messages": [{"role": "user", "content": prompt}],
-            "stream": True
-        }
-        
-        stream = await self.async_client.chat.completions.create(**params)
-        async for chunk in stream:
-            if chunk.choices[0].delta.content:
-                yield chunk.choices[0].delta.content
+    @abstractmethod
+    def health_check(self) -> bool:
+        """Verify the provider is reachable and authenticated."""
+        pass
 
 
 class OllamaLLM(BaseLLM):
-    """Ollama local model adapter.
+    """Local model provider via Ollama."""
     
-    Purpose:
-        Run models locally without API costs. Great for development,
-        privacy-sensitive applications, or offline use.
-    
-    Example:
-        ```python
-        llm = OllamaLLM(LLMConfig(
-            model="llama2",
-            base_url="http://localhost:11434"
-        ))
-        
-        response = llm.call("Write a haiku")
-        ```
-    
-    Requires:
-        - Ollama running locally
-        - Model pulled: `ollama pull llama2`
-    """
-    
-    def __init__(self, config: LLMConfig):
-        super().__init__(config)
-        self.base_url = config.base_url or "http://localhost:11434"
-    
-    def call(self, prompt: str, **kwargs) -> str:
-        """Synchronous Ollama call."""
-        import requests
-        
-        url = f"{self.base_url}/api/generate"
-        payload = {
-            "model": kwargs.get("model", self.config.model),
+    def __init__(self, model: str = "llama3", timeout: int = 30, base_url: str = "http://localhost:11434"):
+        self.model = model
+        self.timeout = timeout
+        self.base_url = base_url
+
+    def _post(self, endpoint: str, payload: dict) -> urllib.request.Request:
+        data = json.dumps(payload).encode('utf-8')
+        req = urllib.request.Request(f"{self.base_url}{endpoint}", data=data)
+        req.add_header('Content-Type', 'application/json')
+        return req
+
+    def complete(self, prompt: str) -> str:
+        req = self._post("/api/generate", {
+            "model": self.model,
             "prompt": prompt,
-            "stream": False,
-            "options": {
-                "temperature": kwargs.get("temperature", self.config.temperature),
-                "num_predict": kwargs.get("max_tokens", self.config.max_tokens)
-            }
-        }
-        
-        response = requests.post(url, json=payload, timeout=self.config.timeout)
-        response.raise_for_status()
-        return response.json()["response"]
-    
-    async def acall(self, prompt: str, **kwargs) -> str:
-        """Asynchronous Ollama call."""
-        import aiohttp
-        
-        url = f"{self.base_url}/api/generate"
-        payload = {
-            "model": kwargs.get("model", self.config.model),
+            "stream": False
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as response:
+                result = json.loads(response.read().decode())
+                return result.get("response", "")
+        except Exception as e:
+            raise RuntimeError(f"Ollama complete failed: {e}")
+
+    def stream(self, prompt: str) -> Iterator[str]:
+        req = self._post("/api/generate", {
+            "model": self.model,
             "prompt": prompt,
-            "stream": False,
-            "options": {
-                "temperature": kwargs.get("temperature", self.config.temperature),
-                "num_predict": kwargs.get("max_tokens", self.config.max_tokens)
-            }
-        }
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, timeout=self.config.timeout) as resp:
-                resp.raise_for_status()
-                data = await resp.json()
-                return data["response"]
-    
-    async def stream(self, prompt: str, **kwargs) -> AsyncIterator[str]:
-        """Stream Ollama response."""
-        import aiohttp
-        
-        url = f"{self.base_url}/api/generate"
-        payload = {
-            "model": kwargs.get("model", self.config.model),
-            "prompt": prompt,
-            "stream": True,
-            "options": {
-                "temperature": kwargs.get("temperature", self.config.temperature),
-                "num_predict": kwargs.get("max_tokens", self.config.max_tokens)
-            }
-        }
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload) as resp:
-                resp.raise_for_status()
-                async for line in resp.content:
+            "stream": True
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as response:
+                for line in response:
                     if line:
-                        data = json.loads(line)
-                        if "response" in data:
-                            yield data["response"]
+                        chunk = json.loads(line.decode())
+                        yield chunk.get("response", "")
+        except Exception as e:
+            raise RuntimeError(f"Ollama stream failed: {e}")
+
+    def health_check(self) -> bool:
+        try:
+            req = urllib.request.Request(f"{self.base_url}/api/tags")
+            with urllib.request.urlopen(req, timeout=5) as response:
+                return response.status == 200
+        except Exception:
+            return False
+
+
+class OpenAILLM(BaseLLM):
+    """OpenAI API Provider with exponential backoff retries."""
+    
+    def __init__(self, model: str = "gpt-4o", temperature: float = 0.7, max_tokens: int = 4096, api_key: Optional[str] = None):
+        self.model = model
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
+        if not self.api_key:
+            raise ValueError("api_key must be provided directly or via OPENAI_API_KEY environment variable")
+
+    def _request_with_retry(self, payload: dict, stream: bool = False, max_retries: int = 3):
+        req = urllib.request.Request("https://api.openai.com/v1/chat/completions", data=json.dumps(payload).encode('utf-8'))
+        req.add_header('Content-Type', 'application/json')
+        req.add_header('Authorization', f'Bearer {self.api_key}')
+        
+        for attempt in range(max_retries):
+            try:
+                return urllib.request.urlopen(req, timeout=30)
+            except urllib.error.HTTPError as e:
+                if e.code == 429 and attempt < max_retries - 1: # Rate limited
+                    time.sleep(2 ** attempt) # Exponential backoff
+                    continue
+                raise RuntimeError(f"OpenAI API error: {e.read().decode()}")
+            except Exception as e:
+                raise RuntimeError(f"OpenAI connection error: {e}")
+        raise RuntimeError("OpenAI API exhausted max retries")
+
+    def complete(self, prompt: str) -> str:
+        payload = {
+            "model": self.model,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False
+        }
+        with self._request_with_retry(payload) as response:
+            data = json.loads(response.read().decode())
+            return data["choices"][0]["message"]["content"]
+
+    def stream(self, prompt: str) -> Iterator[str]:
+        payload = {
+            "model": self.model,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": True
+        }
+        with self._request_with_retry(payload, stream=True) as response:
+            for line in response:
+                line = line.decode().strip()
+                if line.startswith("data: ") and line != "data: [DONE]":
+                    data = json.loads(line[6:])
+                    delta = data["choices"][0].get("delta", {})
+                    if "content" in delta:
+                        yield delta["content"]
+
+    def health_check(self) -> bool:
+        req = urllib.request.Request("https://api.openai.com/v1/models")
+        req.add_header('Authorization', f'Bearer {self.api_key}')
+        try:
+            with urllib.request.urlopen(req, timeout=5) as response:
+                return response.status == 200
+        except Exception:
+            return False
 
 
 class AnthropicLLM(BaseLLM):
-    """Anthropic Claude adapter.
+    """Anthropic API Provider."""
     
-    Purpose:
-        Access Claude models (Sonnet, Opus) via Anthropic API.
-    
-    Example:
-        ```python
-        llm = AnthropicLLM(LLMConfig(
-            model="claude-3-opus-20240229",
-            api_key=os.getenv("ANTHROPIC_API_KEY")
-        ))
-        ```
-    
-    Requires:
-        ```bash
-        pip install anthropic
-        ```
-    """
-    
-    def __init__(self, config: LLMConfig):
-        super().__init__(config)
+    def __init__(self, model: str = "claude-3-opus-20240229", temperature: float = 0.7, max_tokens: int = 4096, api_key: Optional[str] = None):
+        self.model = model
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
+        if not self.api_key:
+            raise ValueError("api_key must be provided directly or via ANTHROPIC_API_KEY")
+
+    def _post(self, payload: dict) -> urllib.request.Request:
+        req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=json.dumps(payload).encode('utf-8'))
+        req.add_header('Content-Type', 'application/json')
+        req.add_header('x-api-key', self.api_key)
+        req.add_header('anthropic-version', '2023-06-01')
+        return req
+
+    def complete(self, prompt: str) -> str:
+        payload = {
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "messages": [{"role": "user", "content": prompt}]
+        }
         try:
-            import anthropic
-            self.client = anthropic.Anthropic(api_key=config.api_key)
-            self.async_client = anthropic.AsyncAnthropic(api_key=config.api_key)
-        except ImportError:
-            raise ImportError("anthropic package required. Install: pip install anthropic")
-    
-    def call(self, prompt: str, **kwargs) -> str:
-        """Synchronous Claude call."""
-        response = self.client.messages.create(
-            model=kwargs.get("model", self.config.model),
-            max_tokens=kwargs.get("max_tokens", self.config.max_tokens),
-            temperature=kwargs.get("temperature", self.config.temperature),
-            messages=[{"role": "user", "content": prompt}]
-        )
-        return response.content[0].text
-    
-    async def acall(self, prompt: str, **kwargs) -> str:
-        """Asynchronous Claude call."""
-        response = await self.async_client.messages.create(
-            model=kwargs.get("model", self.config.model),
-            max_tokens=kwargs.get("max_tokens", self.config.max_tokens),
-            temperature=kwargs.get("temperature", self.config.temperature),
-            messages=[{"role": "user", "content": prompt}]
-        )
-        return response.content[0].text
-    
-    async def stream(self, prompt: str, **kwargs) -> AsyncIterator[str]:
-        """Stream Claude response."""
-        async with self.async_client.messages.stream(
-            model=kwargs.get("model", self.config.model),
-            max_tokens=kwargs.get("max_tokens", self.config.max_tokens),
-            temperature=kwargs.get("temperature", self.config.temperature),
-            messages=[{"role": "user", "content": prompt}]
-        ) as stream:
-            async for text in stream.text_stream:
-                yield text
+            with urllib.request.urlopen(self._post(payload), timeout=30) as response:
+                data = json.loads(response.read().decode())
+                return data["content"][0]["text"]
+        except Exception as e:
+            raise RuntimeError(f"Anthropic complete failed: {e}")
+
+    def stream(self, prompt: str) -> Iterator[str]:
+        payload = {
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": True
+        }
+        try:
+            with urllib.request.urlopen(self._post(payload), timeout=30) as response:
+                for line in response:
+                    line = line.decode().strip()
+                    if line.startswith("data: "):
+                        data = json.loads(line[6:])
+                        if data.get("type") == "content_block_delta":
+                            yield data["delta"].get("text", "")
+        except Exception as e:
+            raise RuntimeError(f"Anthropic stream failed: {e}")
+
+    def health_check(self) -> bool:
+        # Anthropic doesn't have a simple models endpoint that works universally unauthenticated, 
+        # so we ping a fast cheap endpoint or rely on initial auth testing.
+        payload = {"model": "claude-3-haiku-20240307", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}
+        try:
+            with urllib.request.urlopen(self._post(payload), timeout=5) as response:
+                return response.status == 200
+        except Exception:
+            return False
 
 
-__all__ = [
-    "BaseLLM",
-    "LLMConfig",
-    "OpenAILLM",
-    "OllamaLLM",
-    "AnthropicLLM",
-]
+class OpenRouterLLM(BaseLLM):
+    """OpenRouter Provider for universal model passthrough."""
+    
+    def __init__(self, model: str, temperature: float = 0.7, max_tokens: int = 4096, api_key: Optional[str] = None):
+        self.model = model
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
+        if not self.api_key:
+            raise ValueError("api_key must be provided directly or via OPENROUTER_API_KEY")
+
+    def _post(self, payload: dict) -> urllib.request.Request:
+        req = urllib.request.Request("https://openrouter.ai/api/v1/chat/completions", data=json.dumps(payload).encode('utf-8'))
+        req.add_header('Content-Type', 'application/json')
+        req.add_header('Authorization', f'Bearer {self.api_key}')
+        req.add_header('HTTP-Referer', 'https://nkit.ai')
+        req.add_header('X-Title', 'NKit Framework')
+        return req
+
+    def complete(self, prompt: str) -> str:
+        payload = {
+            "model": self.model,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False
+        }
+        try:
+            with urllib.request.urlopen(self._post(payload), timeout=30) as response:
+                data = json.loads(response.read().decode())
+                return data["choices"][0]["message"]["content"]
+        except Exception as e:
+            raise RuntimeError(f"OpenRouter complete failed: {e}")
+
+    def stream(self, prompt: str) -> Iterator[str]:
+        payload = {
+            "model": self.model,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": True
+        }
+        try:
+            with urllib.request.urlopen(self._post(payload), timeout=30) as response:
+                for line in response:
+                    line = line.decode().strip()
+                    if line.startswith("data: ") and line != "data: [DONE]":
+                        data = json.loads(line[6:])
+                        delta = data["choices"][0].get("delta", {})
+                        if "content" in delta:
+                            yield delta["content"]
+        except Exception as e:
+            raise RuntimeError(f"OpenRouter stream failed: {e}")
+
+    def health_check(self) -> bool:
+        req = urllib.request.Request("https://openrouter.ai/api/v1/auth/key")
+        req.add_header('Authorization', f'Bearer {self.api_key}')
+        try:
+            with urllib.request.urlopen(req, timeout=5) as response:
+                return response.status == 200
+        except Exception:
+            return False
+
+__all__ = ["BaseLLM", "OllamaLLM", "OpenAILLM", "AnthropicLLM", "OpenRouterLLM"]

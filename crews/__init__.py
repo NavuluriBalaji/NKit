@@ -53,8 +53,14 @@ class Agent:
         """Initialize agent implementation if needed."""
         # Import here to avoid circular dependency
         if self._agent_impl is None and self.llm is not None:
-            from ..nbagents import Agent as NkitAgent
-            self._agent_impl = NkitAgent(llm_client=self.llm, tools=self.tools)
+            from ..agent import Agent as NkitAgent
+            self._agent_impl = NkitAgent(llm=self.llm)
+            if self.tools:
+                for t in self.tools:
+                    if hasattr(t, "name") and hasattr(t, "execute") and hasattr(t, "description"):
+                        self._agent_impl.add_tool(t.name, t.execute, t.description)
+                    elif hasattr(t, "name") and hasattr(t, "func") and hasattr(t, "description"):
+                        self._agent_impl.add_tool(t.name, t.func, t.description)
     
     async def execute_task(self, task: Any, context: Optional[Dict] = None) -> str:
         """Execute a task.
@@ -81,8 +87,8 @@ Expected Output: {task.expected_output}
         
         # Execute with agent implementation
         if self._agent_impl:
-            if hasattr(self._agent_impl, 'arun'):
-                result = await self._agent_impl.arun(prompt)
+            if hasattr(self._agent_impl, 'run_async'):
+                result = await self._agent_impl.run_async(prompt)
             else:
                 result = self._agent_impl.run(prompt)
         else:

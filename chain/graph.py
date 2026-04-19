@@ -4,8 +4,8 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Union
 
-from nkit.utils import is_async_function, run_sync_or_async
-from nkit.memory import Memory
+from NKit.utils import is_async_function, run_sync_or_async
+from NKit.memory import Memory
 
 
 @dataclass

@@ -190,7 +190,7 @@ class Agent:
     def __init__(
         self,
         llm: Callable[[str], str],
-        max_steps: int = 10,
+        max_steps: int = 20,
         max_retries: int = 3,
         include_builtin_tools: bool = True,
         log_level: str = "INFO",
@@ -198,6 +198,7 @@ class Agent:
         registry: Optional[ToolRegistry] = None,
         prompt_service: Optional["PromptService"] = None,
         response_parser: Optional["ResponseParser"] = None,
+        observer: Optional[Any] = None,
     ):
         """Initialize agent with dependencies.
         
@@ -238,6 +239,7 @@ class Agent:
         self.prompt_service = prompt_service or ReActPromptService()
         self.parser = response_parser or JSONMarkdownResponseParser()
         self.memory = memory or Memory()
+        self.observer = observer
         
         self.logger = setup_logger(f"nkit.agent", log_level)
         self.logger.info(f"Agent initialized with {len(self.registry.tools)} tools")
@@ -307,8 +309,18 @@ class Agent:
         for attempt in range(self.max_retries):
             try:
                 self.logger.debug(f"Tool '{tool.name}' attempt {attempt + 1}/{self.max_retries}")
-                result = await tool.execute(**inputs)
-                return str(result)
+                # Enforce tool execution timeout (30s max)
+                result = await asyncio.wait_for(tool.execute(**inputs), timeout=30.0)
+                result_str = str(result)
+                # Enforce result length limit (10KB approx 10000 chars)
+                if len(result_str) > 10000:
+                    result_str = result_str[:9997] + "..."
+                return result_str
+            except asyncio.TimeoutError:
+                self.logger.warning(f"Tool '{tool.name}' timed out after 30s")
+                if attempt == self.max_retries - 1:
+                    return f"Error: Tool '{tool.name}' exceeded 30s timeout on all retries."
+                continue
             except Exception as e:
                 self.logger.warning(f"Tool '{tool.name}' attempt {attempt + 1} failed: {e}")
                 if attempt == self.max_retries - 1:
@@ -390,6 +402,8 @@ Please provide a valid JSON response as specified in the original prompt:
             - Tool execution failures are logged but don't crash agent
         """
         self.logger.info(f"Starting agent run for task: {task[:100]}...")
+        if self.observer:
+            self.observer.emit("agent.start", task=task, max_steps=self.max_steps)
         history: List[Step] = []
         
         for i in range(self.max_steps):
@@ -413,6 +427,9 @@ Please provide a valid JSON response as specified in the original prompt:
                 resp_dict = await self._retry_llm(prompt, response)
                 thought = resp_dict.get("thought")
 
+            if self.observer:
+                self.observer.emit("agent.reasoning", thought=thought, step=i+1, goal=task)
+
             step = Step(thought, i + 1)
             history.append(step)
 
@@ -423,6 +440,8 @@ Please provide a valid JSON response as specified in the original prompt:
                     self.memory.set("last_answer", final)
                 except Exception as e:
                     self.logger.debug(f"Failed to write final answer to memory: {e}")
+                if self.observer:
+                    self.observer.emit("agent.end", final_answer=final, total_steps=i+1)
                 return final
 
             # Execute tool if action present
@@ -432,11 +451,20 @@ Please provide a valid JSON response as specified in the original prompt:
                     resp_dict["action_input"])
                 
                 tool = self.registry.get(action)
+                
+                if self.observer:
+                    self.observer.emit("tool.before", tool_name=action, args=inputs, why=thought)
+                
+                success = False
                 if tool:
                     obs = await self._execute_with_retry(tool, inputs)
+                    success = "Unexpected retry failure" not in str(obs) and "Error after" not in str(obs)
                 else:
                     obs = f"Tool '{action}' not found"
                     self.logger.error(f"Tool not found: {action}")
+                
+                if self.observer:
+                    self.observer.emit("tool.after", tool_name=action, result=obs, success=success)
                 
                 step.set_action(action, inputs)
                 step.set_obs(obs)

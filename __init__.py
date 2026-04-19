@@ -17,6 +17,7 @@ __version__ = "0.2.0"
 from .agent import Agent, Step
 from .tools import Tool, ToolRegistry
 from .memory import Memory
+from .observer import LiveObserver
 from .utils import setup_logger
 from .chain import Chain, LLMChain
 from .legacy.llm_adapter import LLMAdapter, CallableLLMAdapter
@@ -46,4 +47,6 @@ __all__ = [
     "hooks",
     "telemetry",
     "cli",
+    "observer",
+    "LiveObserver",
 ]
