@@ -29,6 +29,10 @@ class BaseLLM(ABC):
         """Process the prompt and return the complete string."""
         pass
 
+    def __call__(self, prompt: str) -> str:
+        """Makes the object callable, automatically routing to .complete()."""
+        return self.complete(prompt)
+
     @abstractmethod
     def stream(self, prompt: str) -> Iterator[str]:
         """Process the prompt and yield streaming output chunks."""

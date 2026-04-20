@@ -65,6 +65,7 @@ class ToolRegistry:
 
     def _register_builtin_tools(self):
         from .builtin_tools import BuiltinTools
+        from .dynamic import get_codeact_tools
         
         # Create a default instance of BuiltinTools
         tools_instance = BuiltinTools()
@@ -80,6 +81,13 @@ class ToolRegistry:
         ]
         for name, func, desc in builtin_tools:
             self.register(Tool(name, func, desc))
+
+        # Dynamically inject CodeACT capabilities
+        try:
+            for codeact_tool in get_codeact_tools(self):
+                self.register(codeact_tool)
+        except Exception as e:
+            logger.warning(f"Failed to bind CodeACT tools: {e}")
 
     def decorator(self, name: str, desc: str = None):
         def wrap(func):
