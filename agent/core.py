@@ -26,6 +26,7 @@ import asyncio
 import json
 import logging
 import re
+import uuid
 from typing import Callable, List, Optional, Any, TYPE_CHECKING
 
 from ..utils import is_async_function, run_sync_or_async, setup_logger
@@ -38,6 +39,16 @@ if TYPE_CHECKING:
 
 
 logger = setup_logger("nkit.nbagents")
+
+# Try to import PoT components (optional, for PoT mode)
+try:
+    from ..planner import ThoughtPlanner
+    from ..executor import ThoughtExecutor
+    HAS_POT = True
+except ImportError:
+    HAS_POT = False
+    ThoughtPlanner = None
+    ThoughtExecutor = None
 
 
 class Step:
@@ -199,39 +210,49 @@ class Agent:
         prompt_service: Optional["PromptService"] = None,
         response_parser: Optional["ResponseParser"] = None,
         observer: Optional[Any] = None,
+        safety_gate: Optional[Any] = None,
+        why_log: Optional[Any] = None,
+        reasoning_mode: str = "react",  # "react" or "pot"
+        planner: Optional[Any] = None,
+        executor: Optional[Any] = None,
     ):
         """Initialize agent with dependencies.
         
         Args:
             llm: LLM callable accepting prompt (str) and returning response (str).
-                 Can be sync or async.
-            max_steps: Maximum reasoning iterations before failing (default 10).
+            max_steps: Maximum reasoning iterations (default 20).
             max_retries: Tool execution retry attempts (default 3).
-            include_builtin_tools: Auto-register built-in tools if True (default True).
-                                   Ignored if custom registry provided.
+            include_builtin_tools: Auto-register built-in tools (default True).
             log_level: Logging level: DEBUG, INFO, WARNING, ERROR (default INFO).
-            memory: Memory store instance. Defaults to in-memory Memory().
-            registry: Tool registry. Defaults to new ToolRegistry(include_builtin_tools).
-            prompt_service: Prompt builder. Defaults to ReActPromptService().
-            response_parser: LLM response parser. Defaults to JSONMarkdownResponseParser().
+            memory: Memory store instance (default in-memory Memory()).
+            registry: Tool registry (default ToolRegistry with built-ins).
+            prompt_service: Prompt builder (default ReActPromptService).
+            response_parser: LLM response parser (default JSONMarkdownResponseParser).
+            observer: LiveObserver for event streaming (optional).
+            safety_gate: SafetyGate for pre-execution verification (optional).
+            why_log: WhyLog for audit trail (optional).
+            reasoning_mode: "react" (iterative) or "pot" (plan once, execute) (default "react").
+            planner: ThoughtPlanner for PoT mode (optional, auto-created if needed).
+            executor: ThoughtExecutor for PoT mode (optional, auto-created if needed).
         
         Design Note:
+            Agent supports two reasoning modes:
+            - ReAct (default): LLM called multiple times iteratively
+            - PoT (Program of Thought): LLM called once to generate complete plan
+            
             All dependencies have sensible defaults, preserving backward compatibility.
-            Override any component to customize behavior without modifying Agent code.
-        
-        Security Note:
-            - Validate llm is callable
-            - max_steps and max_retries prevent runaway execution
-            - Tool execution is isolated (no shell=True by default in built-ins)
         """
         if not callable(llm):
             raise TypeError("llm must be callable")
         if max_steps < 1 or max_retries < 1:
             raise ValueError("max_steps and max_retries must be positive")
+        if reasoning_mode not in ("react", "pot"):
+            raise ValueError("reasoning_mode must be 'react' or 'pot'")
         
         self.llm = llm
         self.max_steps = max_steps
         self.max_retries = max_retries
+        self.reasoning_mode = reasoning_mode
         self.is_llm_async = is_async_function(llm)
         
         # Dependency injection with defaults
@@ -240,9 +261,18 @@ class Agent:
         self.parser = response_parser or JSONMarkdownResponseParser()
         self.memory = memory or Memory()
         self.observer = observer
+        self.safety_gate = safety_gate
+        self.why_log = why_log
+        
+        # Session tracking for audit trail
+        self.session_id = str(uuid.uuid4())
+        
+        # PoT mode components (lazy initialization if needed)
+        self.planner = planner
+        self.executor = executor
         
         self.logger = setup_logger(f"nkit.agent", log_level)
-        self.logger.info(f"Agent initialized with {len(self.registry.tools)} tools")
+        self.logger.info(f"Agent initialized with {len(self.registry.tools)} tools (mode: {reasoning_mode}, session: {self.session_id})")
 
     def tool(self, name: str, desc: str = None):
         """Decorator to register a function as a tool.
@@ -378,7 +408,7 @@ Please provide a valid JSON response as specified in the original prompt:
             1. Build prompt with task + tools + history + memory
             2. Call LLM
             3. Parse response
-            4. Execute tool if action present
+            4. Execute tool if action present (with SafetyGate pre-check)
             5. Record step
             6. Repeat until final_answer or max_steps
         
@@ -395,92 +425,228 @@ Please provide a valid JSON response as specified in the original prompt:
             - Async-first design for I/O efficiency
             - History limited by PromptService (token management)
             - Memory updated on completion (last_answer key)
+            - SafetyGate intercepts dangerous actions
+            - WhyLog captures full reasoning chain
+            - Observer emits real-time events
         
         Security Note:
             - Task description should be sanitized by caller if from untrusted source
             - Max steps prevents infinite loops
             - Tool execution failures are logged but don't crash agent
+            - SafetyGate blocks destructive actions before execution
+            - All actions logged to WhyLog for audit trail
         """
-        self.logger.info(f"Starting agent run for task: {task[:100]}...")
+        self.logger.info(f"Starting agent run for task: {task[:100]}... (session: {self.session_id})")
         if self.observer:
-            self.observer.emit("agent.start", task=task, max_steps=self.max_steps)
+            self.observer.emit("agent.start", task=task, max_steps=self.max_steps, session_id=self.session_id)
+        
         history: List[Step] = []
         
-        for i in range(self.max_steps):
-            # Build prompt using injected service
-            prompt = self.prompt_service.build_agent_prompt(task, self.registry, history, self.memory)
-            self.logger.debug(f"Iteration {i + 1}/{self.max_steps}")
-            print(f'\nIteration: {i + 1}\n{"=" * 15} PROMPT {"=" * 15}\n{prompt}\n')
+        try:
+            for i in range(self.max_steps):
+                # Build prompt using injected service
+                prompt = self.prompt_service.build_agent_prompt(task, self.registry, history, self.memory)
+                self.logger.debug(f"Iteration {i + 1}/{self.max_steps}")
+                print(f'\nIteration: {i + 1}\n{"=" * 15} PROMPT {"=" * 15}\n{prompt}\n')
 
-            # Call LLM (handles sync/async)
-            response = re.sub(r'<think>.*?</think>', '', 
-                            await run_sync_or_async(self.llm, prompt), 
-                            flags=re.DOTALL)
-            print(f"\n{'=' * 15} LLM Response {'=' * 15}\n{response}\n\n")
-            
-            # Parse response using injected parser
-            resp_dict = self.parser.parse(response)
+                # Call LLM (handles sync/async)
+                response = re.sub(r'<think>.*?</think>', '', 
+                                await run_sync_or_async(self.llm, prompt), 
+                                flags=re.DOTALL)
+                print(f"\n{'=' * 15} LLM Response {'=' * 15}\n{response}\n\n")
+                
+                # Parse response using injected parser
+                resp_dict = self.parser.parse(response)
 
-            # Validate and retry if malformed
-            if not (thought := resp_dict.get("thought")) or not (resp_dict.get("action") or resp_dict.get("final_answer")):
-                self.logger.warning("Invalid LLM response format, retrying...")
-                resp_dict = await self._retry_llm(prompt, response)
-                thought = resp_dict.get("thought")
+                # Validate and retry if malformed
+                if not (thought := resp_dict.get("thought")) or not (resp_dict.get("action") or resp_dict.get("final_answer")):
+                    self.logger.warning("Invalid LLM response format, retrying...")
+                    resp_dict = await self._retry_llm(prompt, response)
+                    thought = resp_dict.get("thought")
 
-            if self.observer:
-                self.observer.emit("agent.reasoning", thought=thought, step=i+1, goal=task)
-
-            step = Step(thought, i + 1)
-            history.append(step)
-
-            # Check for completion
-            if final := resp_dict.get("final_answer"):
-                self.logger.info("Agent completed successfully with final answer")
-                try:
-                    self.memory.set("last_answer", final)
-                except Exception as e:
-                    self.logger.debug(f"Failed to write final answer to memory: {e}")
                 if self.observer:
-                    self.observer.emit("agent.end", final_answer=final, total_steps=i+1)
-                return final
+                    self.observer.emit("agent.reasoning", thought=thought, step=i+1, goal=task, session_id=self.session_id)
 
-            # Execute tool if action present
-            if action := resp_dict.get("action"):
-                # Parse action_input (may be string or dict)
-                inputs = resp_dict["action_input"] if isinstance(resp_dict["action_input"], dict) else json.loads(
-                    resp_dict["action_input"])
-                
-                tool = self.registry.get(action)
-                
-                if self.observer:
-                    self.observer.emit("tool.before", tool_name=action, args=inputs, why=thought)
-                
-                success = False
-                if tool:
-                    obs = await self._execute_with_retry(tool, inputs)
-                    success = "Unexpected retry failure" not in str(obs) and "Error after" not in str(obs)
+                step = Step(thought, i + 1)
+                history.append(step)
+
+                # Check for completion
+                if final := resp_dict.get("final_answer"):
+                    self.logger.info("Agent completed successfully with final answer")
+                    try:
+                        self.memory.set("last_answer", final)
+                    except Exception as e:
+                        self.logger.debug(f"Failed to write final answer to memory: {e}")
+                    
+                    # Log to WhyLog
+                    if self.why_log:
+                        try:
+                            self.why_log.log(
+                                session_id=self.session_id,
+                                event_type="completion",
+                                goal=task,
+                                thought=thought,
+                                action=None,
+                                result=final,
+                                why="Agent reached final answer"
+                            )
+                        except Exception as e:
+                            self.logger.debug(f"Failed to log to WhyLog: {e}")
+                    
+                    if self.observer:
+                        self.observer.emit("agent.end", final_answer=final, total_steps=i+1, session_id=self.session_id)
+                    return final
+
+                # Execute tool if action present
+                if action := resp_dict.get("action"):
+                    # Parse action_input (may be string or dict)
+                    inputs = resp_dict["action_input"] if isinstance(resp_dict["action_input"], dict) else json.loads(
+                        resp_dict["action_input"])
+                    
+                    tool = self.registry.get(action)
+                    
+                    # PRE-EXECUTION: Safety check via SafetyGate
+                    gate_blocked = False
+                    gate_blocked_reason = None
+                    human_approved = False
+                    
+                    if self.safety_gate and tool:
+                        try:
+                            self.logger.debug(f"Running safety gate check for tool '{action}'")
+                            gate_result = self.safety_gate.evaluate(
+                                tool_name=action,
+                                tool_args=inputs,
+                                goal=task,
+                                why=thought
+                            )
+                            gate_blocked = not gate_result.get("allowed", True)
+                            gate_blocked_reason = gate_result.get("reason", "Blocked by SafetyGate")
+                            human_approved = gate_result.get("human_approved", False)
+                            
+                            if gate_blocked:
+                                self.logger.warning(f"SafetyGate blocked tool '{action}': {gate_blocked_reason}")
+                        except Exception as e:
+                            self.logger.error(f"SafetyGate evaluation failed: {e}")
+                    
+                    if self.observer:
+                        self.observer.emit(
+                            "tool.before", 
+                            tool_name=action, 
+                            args=inputs, 
+                            why=thought,
+                            session_id=self.session_id,
+                            blocked=gate_blocked,
+                            reason=gate_blocked_reason
+                        )
+                    
+                    success = False
+                    obs = ""
+                    
+                    if gate_blocked:
+                        # Tool was blocked by SafetyGate
+                        obs = f"Tool '{action}' was blocked: {gate_blocked_reason}"
+                        if human_approved:
+                            obs += " (but human approved execution)"
+                        self.logger.warning(obs)
+                    elif tool:
+                        # Tool execution with retry
+                        obs = await self._execute_with_retry(tool, inputs)
+                        success = "Unexpected retry failure" not in str(obs) and "Error after" not in str(obs)
+                    else:
+                        # Tool not found
+                        obs = f"Tool '{action}' not found"
+                        self.logger.error(f"Tool not found: {action}")
+                    
+                    if self.observer:
+                        self.observer.emit(
+                            "tool.after", 
+                            tool_name=action, 
+                            result=obs, 
+                            success=success,
+                            blocked=gate_blocked,
+                            session_id=self.session_id
+                        )
+                    
+                    # Log to WhyLog
+                    if self.why_log:
+                        try:
+                            self.why_log.log(
+                                session_id=self.session_id,
+                                event_type="tool_execution",
+                                goal=task,
+                                thought=thought,
+                                action=action,
+                                result=obs[:500],  # Truncate for audit log
+                                why=thought,
+                                was_blocked=gate_blocked,
+                                human_approved=human_approved
+                            )
+                        except Exception as e:
+                            self.logger.debug(f"Failed to log to WhyLog: {e}")
+                    
+                    step.set_action(action, inputs)
+                    step.set_obs(obs)
                 else:
-                    obs = f"Tool '{action}' not found"
-                    self.logger.error(f"Tool not found: {action}")
-                
-                if self.observer:
-                    self.observer.emit("tool.after", tool_name=action, result=obs, success=success)
-                
-                step.set_action(action, inputs)
-                step.set_obs(obs)
-            else:
-                error_msg = "No action or final answer provided"
-                self.logger.error(error_msg)
-                raise Exception(error_msg)
+                    error_msg = "No action or final answer provided"
+                    self.logger.error(error_msg)
+                    
+                    if self.observer:
+                        self.observer.emit("agent.error", error=error_msg, step=i+1, session_id=self.session_id)
+                    
+                    raise Exception(error_msg)
 
-        error_msg = f"Max steps ({self.max_steps}) reached without completion"
-        self.logger.error(error_msg)
-        raise Exception(error_msg)
+            # Max steps reached
+            error_msg = f"Max steps ({self.max_steps}) reached without completion"
+            self.logger.error(error_msg)
+            
+            if self.observer:
+                self.observer.emit("agent.error", error=error_msg, total_steps=self.max_steps, session_id=self.session_id)
+            
+            if self.why_log:
+                try:
+                    self.why_log.log(
+                        session_id=self.session_id,
+                        event_type="error",
+                        goal=task,
+                        thought="Max steps reached",
+                        action=None,
+                        result=error_msg,
+                        why="Agent exceeded maximum iterations"
+                    )
+                except Exception as e:
+                    self.logger.debug(f"Failed to log to WhyLog: {e}")
+            
+            raise Exception(error_msg)
+            
+        except Exception as e:
+            # Catch all exceptions and emit error event
+            error_str = str(e)
+            self.logger.error(f"Agent execution failed: {error_str}")
+            
+            if self.observer:
+                self.observer.emit("agent.error", error=error_str, session_id=self.session_id)
+            
+            if self.why_log:
+                try:
+                    self.why_log.log(
+                        session_id=self.session_id,
+                        event_type="error",
+                        goal=task,
+                        thought="Exception occurred",
+                        action=None,
+                        result=error_str,
+                        why=f"Exception: {type(e).__name__}"
+                    )
+                except Exception as log_e:
+                    self.logger.debug(f"Failed to log exception to WhyLog: {log_e}")
+            
+            raise
 
     def run(self, task: str) -> str:
-        """Execute agent task (sync wrapper for run_async).
+        """Execute agent task using configured reasoning mode.
         
         Purpose:
+            Dispatcher that selects reasoning mode (ReAct or PoT) and executes.
             Provides synchronous interface for convenience.
             Handles event loop management automatically.
         
@@ -492,16 +658,27 @@ Please provide a valid JSON response as specified in the original prompt:
         
         Design Note:
             - Detects existing event loop to avoid nest-asyncio issues
+            - Dispatches to run_async (ReAct) or run_pot (PoT)
             - Uses ThreadPoolExecutor if loop already running
             - Otherwise runs asyncio.run() directly
         
         Example:
             ```python
-            agent = Agent(llm=my_llm)
+            agent = Agent(llm=my_llm)  # default: ReAct mode
             answer = agent.run("Find capital of France")
-            print(answer)
+            
+            agent_pot = Agent(llm=my_llm, reasoning_mode="pot")
+            answer = agent_pot.run("Find capital of France")  # PoT mode
             ```
         """
+        # Dispatch to appropriate reasoning mode
+        if self.reasoning_mode == "pot":
+            return self._run_pot_sync(task)
+        else:
+            return self._run_react_sync(task)
+
+    def _run_react_sync(self, task: str) -> str:
+        """Execute ReAct mode (iterative reasoning)."""
         try:
             # Check if event loop is running
             loop = asyncio.get_running_loop()
@@ -513,6 +690,72 @@ Please provide a valid JSON response as specified in the original prompt:
         except RuntimeError:
             # No event loop running, safe to use asyncio.run
             return asyncio.run(self.run_async(task))
+
+    def _run_pot_sync(self, task: str) -> str:
+        """Execute PoT mode (plan once, execute deterministically)."""
+        try:
+            loop = asyncio.get_running_loop()
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(asyncio.run, self.run_pot_async(task))
+                return future.result()
+        except RuntimeError:
+            return asyncio.run(self.run_pot_async(task))
+
+    async def run_pot_async(self, task: str) -> str:
+        """Execute task using Program of Thought (plan once).
+        
+        Purpose:
+            LLM generates complete execution plan ONCE, then deterministic
+            executor runs each step. LLM is NOT called again during execution.
+        
+        Args:
+            task: User's task description
+        
+        Returns:
+            Final answer string
+        
+        Raises:
+            RuntimeError: If PoT components not available or planning fails
+        """
+        if not HAS_POT:
+            raise RuntimeError("Program of Thought not available. Install planner and executor components.")
+        
+        # Lazy initialization of planner/executor if not provided
+        if self.planner is None:
+            if ThoughtPlanner is None:
+                raise RuntimeError("ThoughtPlanner not available")
+            self.planner = ThoughtPlanner(self.llm, self.registry)
+        
+        if self.executor is None:
+            if ThoughtExecutor is None:
+                raise RuntimeError("ThoughtExecutor not available")
+            self.executor = ThoughtExecutor(
+                self.registry,
+                observer=self.observer,
+                safety_gate=self.safety_gate,
+                audit_log=self.why_log,
+                max_retries=self.max_retries
+            )
+        
+        self.logger.info(f"Starting PoT agent for: {task[:100]}... (session: {self.session_id})")
+        
+        try:
+            # Step 1: Planning (LLM called ONCE)
+            program = self.planner.plan(task, self.session_id)
+            self.logger.info(f"Plan generated: {len(program.steps)} steps, confidence={program.confidence:.2f}")
+            
+            # Step 2: Execution (deterministic, no LLM calls)
+            result = await self.executor.execute(program)
+            
+            self.logger.info("PoT execution completed successfully")
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"PoT execution failed: {e}")
+            if self.observer:
+                self.observer.emit("agent.error", error=str(e), session_id=self.session_id)
+            raise
 
 
 __all__ = ["Agent", "Step"]

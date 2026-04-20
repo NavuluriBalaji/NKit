@@ -14,14 +14,34 @@ class Tool:
         self.is_async = is_async_function(func)
 
     async def execute(self, **kwargs):
+        """Execute tool with proper error handling.
+        
+        Args:
+            **kwargs: Tool parameters
+            
+        Returns:
+            Tool execution result
+            
+        Raises:
+            ValidationError: If inputs are invalid
+            ToolError: If tool execution fails
+            Exception: For unexpected errors
+        """
         logger.debug(f"Executing tool '{self.name}' with args: {kwargs}")
         try:
             result = await run_sync_or_async(self.func, **kwargs)
             logger.debug(f"Tool '{self.name}' completed successfully")
             return result
         except Exception as e:
-            logger.error(f"Tool '{self.name}' failed: {e}")
-            raise
+            # Import here to avoid circular dependency
+            from .builtin_tools import ValidationError, ToolError
+            
+            if isinstance(e, (ValidationError, ToolError)):
+                logger.warning(f"Tool '{self.name}' input/execution error: {e}")
+                raise
+            else:
+                logger.error(f"Tool '{self.name}' failed unexpectedly: {e}")
+                raise
 
     def __str__(self): 
         return f"Tool: {self.name}\nDesc: {self.desc}\nArgs: {self.schema}\nAsync: {self.is_async}"
@@ -45,13 +65,18 @@ class ToolRegistry:
 
     def _register_builtin_tools(self):
         from .builtin_tools import BuiltinTools
+        
+        # Create a default instance of BuiltinTools
+        tools_instance = BuiltinTools()
+        
+        # Register bound methods as tools
         builtin_tools = [
-            ("web_search", BuiltinTools.web_search, "Search the web for information"),
-            ("read_file", BuiltinTools.read_file, "Read content from a file"),
-            ("write_file", BuiltinTools.write_file, "Write content to a file"),
-            ("list_files", BuiltinTools.list_files, "List files in a directory"),
-            ("get_time", BuiltinTools.get_current_time, "Get current date and time"),
-            ("async_web_search", BuiltinTools.async_web_search, "Async web search"),
+            ("web_search", tools_instance.web_search, "Search the web for information"),
+            ("read_file", tools_instance.read_file, "Read content from a file"),
+            ("write_file", tools_instance.write_file, "Write content to a file"),
+            ("list_files", tools_instance.list_files, "List files in a directory"),
+            ("get_time", tools_instance.get_current_time, "Get current date and time"),
+            ("async_web_search", tools_instance.async_web_search, "Async web search"),
         ]
         for name, func, desc in builtin_tools:
             self.register(Tool(name, func, desc))
@@ -61,5 +86,6 @@ class ToolRegistry:
             self.register(Tool(name, func, desc))
             return func
         return wrap
+
 
 __all__ = ["Tool", "ToolRegistry"]
