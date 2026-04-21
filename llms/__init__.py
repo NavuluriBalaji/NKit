@@ -351,4 +351,71 @@ class GeminiLLM(BaseLLM):
         except Exception:
             return False
 
-__all__ = ["BaseLLM", "OllamaLLM", "OpenAILLM", "AnthropicLLM", "OpenRouterLLM", "GeminiLLM"]
+class LMStudioLLM(BaseLLM):
+    """LM Studio Provider utilizing native HTTP endpoints."""
+    
+    def __init__(self, model: str = "local-model", temperature: float = 0.7, max_tokens: int = 4096, base_url: str = "http://localhost:1234"):
+        """Initialize the LM Studio client.
+        
+        Args:
+            model: The name of the loaded model. LM Studio ignores this if only one model is loaded.
+            temperature: Sampling temperature.
+            max_tokens: Maximum tokens to generate.
+            base_url: The base URL and port where LM Studio server is running (default: http://localhost:1234).
+        """
+        self.model = model
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.base_url = base_url.rstrip("/")
+
+    def _post(self, payload: dict) -> urllib.request.Request:
+        # We leverage the universally compatible OpenAI endpoint that LM Studio explicitly exposes natively
+        req = urllib.request.Request(f"{self.base_url}/v1/chat/completions", data=json.dumps(payload).encode('utf-8'))
+        req.add_header('Content-Type', 'application/json')
+        return req
+
+    def complete(self, prompt: str) -> str:
+        payload = {
+            "model": self.model,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False
+        }
+        try:
+            with urllib.request.urlopen(self._post(payload), timeout=120) as response:
+                data = json.loads(response.read().decode())
+                return data["choices"][0]["message"]["content"]
+        except Exception as e:
+            raise RuntimeError(f"LM Studio complete failed: Are you sure the server is bridging to {self.base_url}? Error: {e}")
+
+    def stream(self, prompt: str) -> Iterator[str]:
+        payload = {
+            "model": self.model,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": True
+        }
+        try:
+            with urllib.request.urlopen(self._post(payload), timeout=120) as response:
+                for line in response:
+                    line = line.decode().strip()
+                    if line.startswith("data: ") and line != "data: [DONE]":
+                        data = json.loads(line[6:])
+                        delta = data["choices"][0].get("delta", {})
+                        if "content" in delta:
+                            yield delta["content"]
+        except Exception as e:
+            raise RuntimeError(f"LM Studio stream failed: {e}")
+
+    def health_check(self) -> bool:
+        # Ping the models endpoint to verify server is alive
+        req = urllib.request.Request(f"{self.base_url}/v1/models")
+        try:
+            with urllib.request.urlopen(req, timeout=5) as response:
+                return response.status == 200
+        except Exception:
+            return False
+
+__all__ = ["BaseLLM", "OllamaLLM", "OpenAILLM", "AnthropicLLM", "OpenRouterLLM", "GeminiLLM", "LMStudioLLM"]
