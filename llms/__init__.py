@@ -11,6 +11,13 @@ Architecture:
     - `complete(prompt: str) -> str`
     - `stream(prompt: str) -> Iterator[str]`
     - `health_check() -> bool`
+    - `count_tokens(prompt: str) -> int` (production tracking)
+
+Features:
+    - Rate limiting (RateLimiter)
+    - Token counting (TokenCounter)
+    - Cost tracking
+    - Exponential backoff on 429 errors
 """
 
 import os
@@ -21,8 +28,23 @@ from typing import Any, Dict, Iterator, Optional
 import urllib.request
 import urllib.error
 
+from .rate_limiter import RateLimiter, TokenCounter, ProviderLimits
+
 class BaseLLM(ABC):
     """Abstract Base Class for all NKit LLM Providers."""
+    
+    def __init__(self, enable_rate_limiting: bool = True, track_tokens: bool = True):
+        """Initialize LLM provider.
+        
+        Args:
+            enable_rate_limiting: Enable automatic rate limiting (default True)
+            track_tokens: Track token usage for cost monitoring (default True)
+        """
+        self.enable_rate_limiting = enable_rate_limiting
+        self.track_tokens = track_tokens
+        self.rate_limiter: Optional[RateLimiter] = None
+        self.total_tokens = 0  # For session tracking
+        self.total_cost = 0.0  # For session tracking
     
     @abstractmethod
     def complete(self, prompt: str) -> str:
@@ -42,12 +64,34 @@ class BaseLLM(ABC):
     def health_check(self) -> bool:
         """Verify the provider is reachable and authenticated."""
         pass
+    
+    def count_tokens(self, prompt: str) -> int:
+        """Estimate tokens for a prompt (can be overridden by providers).
+        
+        Returns:
+            Estimated token count
+        """
+        return TokenCounter.count_tokens(prompt, model=getattr(self, 'model', 'gpt-4o'))
+    
+    def get_token_stats(self) -> Dict[str, Any]:
+        """Get session token usage statistics.
+        
+        Returns:
+            Dict with total_tokens and total_cost
+        """
+        return {
+            "total_tokens": self.total_tokens,
+            "total_cost": self.total_cost,
+            "tokens_per_minute": self.rate_limiter.tokens_per_minute if self.rate_limiter else None,
+        }
 
 
 class OllamaLLM(BaseLLM):
-    """Local model provider via Ollama."""
+    """Local model provider via Ollama (no rate limiting needed)."""
     
-    def __init__(self, model: str = "llama3", timeout: int = 30, base_url: str = "http://localhost:11434"):
+    def __init__(self, model: str = "llama3", timeout: int = 30, base_url: str = "http://localhost:11434",
+                 enable_rate_limiting: bool = False, track_tokens: bool = True):
+        super().__init__(enable_rate_limiting=False, track_tokens=track_tokens)  # Ollama is local, no rate limits
         self.model = model
         self.timeout = timeout
         self.base_url = base_url
@@ -67,7 +111,13 @@ class OllamaLLM(BaseLLM):
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as response:
                 result = json.loads(response.read().decode())
-                return result.get("response", "")
+                response_text = result.get("response", "")
+                
+                # Track token usage if available
+                if self.track_tokens and "eval_count" in result:
+                    self.total_tokens += result.get("eval_count", 0) + result.get("prompt_eval_count", 0)
+                
+                return response_text
         except Exception as e:
             raise RuntimeError(f"Ollama complete failed: {e}")
 
@@ -96,27 +146,51 @@ class OllamaLLM(BaseLLM):
 
 
 class OpenAILLM(BaseLLM):
-    """OpenAI API Provider with exponential backoff retries."""
+    """OpenAI API Provider with exponential backoff retries and rate limiting."""
     
-    def __init__(self, model: str = "gpt-4o", temperature: float = 0.7, max_tokens: int = 4096, api_key: Optional[str] = None):
+    def __init__(self, model: str = "gpt-4o", temperature: float = 0.7, max_tokens: int = 4096, 
+                 api_key: Optional[str] = None, enable_rate_limiting: bool = True, 
+                 track_tokens: bool = True):
+        super().__init__(enable_rate_limiting=enable_rate_limiting, track_tokens=track_tokens)
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
         if not self.api_key:
             raise ValueError("api_key must be provided directly or via OPENAI_API_KEY environment variable")
+        
+        # Initialize rate limiter with OpenAI limits
+        if self.enable_rate_limiting:
+            limits = ProviderLimits.OPENAI
+            self.rate_limiter = RateLimiter(
+                tokens_per_minute=limits["tokens_per_minute"],
+                requests_per_minute=limits["requests_per_minute"]
+            )
+        
+        # Pricing for token tracking (as of 2025)
+        self.input_price_per_1k = 0.005  # $0.005 per 1K input tokens
+        self.output_price_per_1k = 0.015  # $0.015 per 1K output tokens
 
     def _request_with_retry(self, payload: dict, stream: bool = False, max_retries: int = 3):
+        # Rate limiting
+        if self.rate_limiter:
+            estimated_tokens = TokenCounter.count_messages(payload.get("messages", []), self.model)
+            self.rate_limiter.wait_if_needed(estimated_tokens, reason="OpenAI API call")
+        
         req = urllib.request.Request("https://api.openai.com/v1/chat/completions", data=json.dumps(payload).encode('utf-8'))
         req.add_header('Content-Type', 'application/json')
         req.add_header('Authorization', f'Bearer {self.api_key}')
         
         for attempt in range(max_retries):
             try:
-                return urllib.request.urlopen(req, timeout=30)
+                response = urllib.request.urlopen(req, timeout=30)
+                if self.rate_limiter:
+                    self.rate_limiter.reset_backoff()
+                return response
             except urllib.error.HTTPError as e:
-                if e.code == 429 and attempt < max_retries - 1: # Rate limited
-                    time.sleep(2 ** attempt) # Exponential backoff
+                if e.code == 429 and attempt < max_retries - 1:  # Rate limited
+                    if self.rate_limiter:
+                        self.rate_limiter.handle_rate_limit_error()
                     continue
                 raise RuntimeError(f"OpenAI API error: {e.read().decode()}")
             except Exception as e:
@@ -133,7 +207,18 @@ class OpenAILLM(BaseLLM):
         }
         with self._request_with_retry(payload) as response:
             data = json.loads(response.read().decode())
-            return data["choices"][0]["message"]["content"]
+            result = data["choices"][0]["message"]["content"]
+            
+            # Track token usage
+            if self.track_tokens and "usage" in data:
+                input_tokens = data["usage"].get("prompt_tokens", 0)
+                output_tokens = data["usage"].get("completion_tokens", 0)
+                self.total_tokens += input_tokens + output_tokens
+                cost = TokenCounter.estimate_cost(input_tokens, output_tokens, 
+                                                  self.input_price_per_1k, self.output_price_per_1k)
+                self.total_cost += cost
+            
+            return result
 
     def stream(self, prompt: str) -> Iterator[str]:
         payload = {
@@ -163,15 +248,30 @@ class OpenAILLM(BaseLLM):
 
 
 class AnthropicLLM(BaseLLM):
-    """Anthropic API Provider."""
+    """Anthropic API Provider with rate limiting."""
     
-    def __init__(self, model: str = "claude-3-opus-20240229", temperature: float = 0.7, max_tokens: int = 4096, api_key: Optional[str] = None):
+    def __init__(self, model: str = "claude-3-opus-20240229", temperature: float = 0.7, 
+                 max_tokens: int = 4096, api_key: Optional[str] = None, 
+                 enable_rate_limiting: bool = True, track_tokens: bool = True):
+        super().__init__(enable_rate_limiting=enable_rate_limiting, track_tokens=track_tokens)
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
         if not self.api_key:
             raise ValueError("api_key must be provided directly or via ANTHROPIC_API_KEY")
+        
+        # Initialize rate limiter with Anthropic limits
+        if self.enable_rate_limiting:
+            limits = ProviderLimits.ANTHROPIC
+            self.rate_limiter = RateLimiter(
+                tokens_per_minute=limits["tokens_per_minute"],
+                requests_per_minute=limits["requests_per_minute"]
+            )
+        
+        # Pricing for token tracking
+        self.input_price_per_1k = 0.003  # $0.003 per 1K input tokens
+        self.output_price_per_1k = 0.015  # $0.015 per 1K output tokens
 
     def _post(self, payload: dict) -> urllib.request.Request:
         req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=json.dumps(payload).encode('utf-8'))
@@ -181,6 +281,11 @@ class AnthropicLLM(BaseLLM):
         return req
 
     def complete(self, prompt: str) -> str:
+        # Rate limiting
+        if self.rate_limiter:
+            estimated_tokens = TokenCounter.count_tokens(prompt, self.model)
+            self.rate_limiter.wait_if_needed(estimated_tokens, reason="Anthropic API call")
+        
         payload = {
             "model": self.model,
             "max_tokens": self.max_tokens,
@@ -190,7 +295,25 @@ class AnthropicLLM(BaseLLM):
         try:
             with urllib.request.urlopen(self._post(payload), timeout=30) as response:
                 data = json.loads(response.read().decode())
-                return data["content"][0]["text"]
+                result = data["content"][0]["text"]
+                
+                # Track token usage
+                if self.track_tokens and "usage" in data:
+                    input_tokens = data["usage"].get("input_tokens", 0)
+                    output_tokens = data["usage"].get("output_tokens", 0)
+                    self.total_tokens += input_tokens + output_tokens
+                    cost = TokenCounter.estimate_cost(input_tokens, output_tokens,
+                                                      self.input_price_per_1k, self.output_price_per_1k)
+                    self.total_cost += cost
+                
+                if self.rate_limiter:
+                    self.rate_limiter.reset_backoff()
+                
+                return result
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and self.rate_limiter:
+                self.rate_limiter.handle_rate_limit_error()
+            raise RuntimeError(f"Anthropic complete failed: {e}")
         except Exception as e:
             raise RuntimeError(f"Anthropic complete failed: {e}")
 
@@ -214,8 +337,6 @@ class AnthropicLLM(BaseLLM):
             raise RuntimeError(f"Anthropic stream failed: {e}")
 
     def health_check(self) -> bool:
-        # Anthropic doesn't have a simple models endpoint that works universally unauthenticated, 
-        # so we ping a fast cheap endpoint or rely on initial auth testing.
         payload = {"model": "claude-3-haiku-20240307", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}
         try:
             with urllib.request.urlopen(self._post(payload), timeout=5) as response:
@@ -225,15 +346,30 @@ class AnthropicLLM(BaseLLM):
 
 
 class OpenRouterLLM(BaseLLM):
-    """OpenRouter Provider for universal model passthrough."""
+    """OpenRouter Provider for universal model passthrough with rate limiting."""
     
-    def __init__(self, model: str, temperature: float = 0.7, max_tokens: int = 4096, api_key: Optional[str] = None):
+    def __init__(self, model: str, temperature: float = 0.7, max_tokens: int = 4096, 
+                 api_key: Optional[str] = None, enable_rate_limiting: bool = True,
+                 track_tokens: bool = True):
+        super().__init__(enable_rate_limiting=enable_rate_limiting, track_tokens=track_tokens)
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
         if not self.api_key:
             raise ValueError("api_key must be provided directly or via OPENROUTER_API_KEY")
+        
+        # Initialize rate limiter with OpenRouter limits
+        if self.enable_rate_limiting:
+            limits = ProviderLimits.OPENROUTER
+            self.rate_limiter = RateLimiter(
+                tokens_per_minute=limits["tokens_per_minute"],
+                requests_per_minute=limits["requests_per_minute"]
+            )
+        
+        # Default pricing (varies by model)
+        self.input_price_per_1k = 0.005
+        self.output_price_per_1k = 0.015
 
     def _post(self, payload: dict) -> urllib.request.Request:
         req = urllib.request.Request("https://openrouter.ai/api/v1/chat/completions", data=json.dumps(payload).encode('utf-8'))
@@ -244,6 +380,11 @@ class OpenRouterLLM(BaseLLM):
         return req
 
     def complete(self, prompt: str) -> str:
+        # Rate limiting
+        if self.rate_limiter:
+            estimated_tokens = TokenCounter.count_tokens(prompt, self.model)
+            self.rate_limiter.wait_if_needed(estimated_tokens, reason="OpenRouter API call")
+        
         payload = {
             "model": self.model,
             "temperature": self.temperature,
@@ -254,7 +395,25 @@ class OpenRouterLLM(BaseLLM):
         try:
             with urllib.request.urlopen(self._post(payload), timeout=30) as response:
                 data = json.loads(response.read().decode())
-                return data["choices"][0]["message"]["content"]
+                result = data["choices"][0]["message"]["content"]
+                
+                # Track token usage
+                if self.track_tokens and "usage" in data:
+                    input_tokens = data["usage"].get("prompt_tokens", 0)
+                    output_tokens = data["usage"].get("completion_tokens", 0)
+                    self.total_tokens += input_tokens + output_tokens
+                    cost = TokenCounter.estimate_cost(input_tokens, output_tokens,
+                                                      self.input_price_per_1k, self.output_price_per_1k)
+                    self.total_cost += cost
+                
+                if self.rate_limiter:
+                    self.rate_limiter.reset_backoff()
+                
+                return result
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and self.rate_limiter:
+                self.rate_limiter.handle_rate_limit_error()
+            raise RuntimeError(f"OpenRouter complete failed: {e}")
         except Exception as e:
             raise RuntimeError(f"OpenRouter complete failed: {e}")
 
@@ -288,17 +447,37 @@ class OpenRouterLLM(BaseLLM):
             return False
 
 class GeminiLLM(BaseLLM):
-    """Google Gemini API Provider."""
+    """Google Gemini API Provider with rate limiting."""
     
-    def __init__(self, model: str = "gemini-2.5-flash", temperature: float = 0.7, max_tokens: int = 4096, api_key: Optional[str] = None):
+    def __init__(self, model: str = "gemini-2.5-flash", temperature: float = 0.7, max_tokens: int = 4096, 
+                 api_key: Optional[str] = None, enable_rate_limiting: bool = True,
+                 track_tokens: bool = True):
+        super().__init__(enable_rate_limiting=enable_rate_limiting, track_tokens=track_tokens)
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.api_key = api_key or os.environ.get("GEMINI_API_KEY")
         if not self.api_key:
             raise ValueError("api_key must be provided directly or via GEMINI_API_KEY")
+        
+        # Initialize rate limiter with Gemini limits
+        if self.enable_rate_limiting:
+            limits = ProviderLimits.GEMINI
+            self.rate_limiter = RateLimiter(
+                tokens_per_minute=limits["tokens_per_minute"],
+                requests_per_minute=limits["requests_per_minute"]
+            )
+        
+        # Pricing for token tracking
+        self.input_price_per_1k = 0.000075  # Free tier or very cheap
+        self.output_price_per_1k = 0.0003
 
     def complete(self, prompt: str) -> str:
+        # Rate limiting
+        if self.rate_limiter:
+            estimated_tokens = TokenCounter.count_tokens(prompt, self.model)
+            self.rate_limiter.wait_if_needed(estimated_tokens, reason="Gemini API call")
+        
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={self.api_key}"
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
@@ -313,7 +492,25 @@ class GeminiLLM(BaseLLM):
         try:
             with urllib.request.urlopen(req, timeout=30) as response:
                 data = json.loads(response.read().decode())
-                return data["candidates"][0]["content"]["parts"][0].get("text", "")
+                result = data["candidates"][0]["content"]["parts"][0].get("text", "")
+                
+                # Track token usage if available
+                if self.track_tokens and "usageMetadata" in data:
+                    input_tokens = data["usageMetadata"].get("promptTokenCount", 0)
+                    output_tokens = data["usageMetadata"].get("candidatesTokenCount", 0)
+                    self.total_tokens += input_tokens + output_tokens
+                    cost = TokenCounter.estimate_cost(input_tokens, output_tokens,
+                                                      self.input_price_per_1k, self.output_price_per_1k)
+                    self.total_cost += cost
+                
+                if self.rate_limiter:
+                    self.rate_limiter.reset_backoff()
+                
+                return result
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and self.rate_limiter:
+                self.rate_limiter.handle_rate_limit_error()
+            raise RuntimeError(f"Gemini complete failed: {e}")
         except Exception as e:
             raise RuntimeError(f"Gemini complete failed: {e}")
 
@@ -352,9 +549,11 @@ class GeminiLLM(BaseLLM):
             return False
 
 class LMStudioLLM(BaseLLM):
-    """LM Studio Provider utilizing native HTTP endpoints."""
+    """LM Studio Provider utilizing native HTTP endpoints with rate limiting."""
     
-    def __init__(self, model: str = "local-model", temperature: float = 0.7, max_tokens: int = 4096, base_url: str = "http://localhost:1234"):
+    def __init__(self, model: str = "local-model", temperature: float = 0.7, max_tokens: int = 4096, 
+                 base_url: str = "http://localhost:1234", enable_rate_limiting: bool = False,
+                 track_tokens: bool = True):
         """Initialize the LM Studio client.
         
         Args:
@@ -362,7 +561,10 @@ class LMStudioLLM(BaseLLM):
             temperature: Sampling temperature.
             max_tokens: Maximum tokens to generate.
             base_url: The base URL and port where LM Studio server is running (default: http://localhost:1234).
+            enable_rate_limiting: Enable rate limiting (default False, local unlimited)
+            track_tokens: Track token usage (default True)
         """
+        super().__init__(enable_rate_limiting=False, track_tokens=track_tokens)  # Local, no rate limits needed
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
@@ -385,7 +587,15 @@ class LMStudioLLM(BaseLLM):
         try:
             with urllib.request.urlopen(self._post(payload), timeout=120) as response:
                 data = json.loads(response.read().decode())
-                return data["choices"][0]["message"]["content"]
+                result = data["choices"][0]["message"]["content"]
+                
+                # Track token usage if available
+                if self.track_tokens and "usage" in data:
+                    input_tokens = data["usage"].get("prompt_tokens", 0)
+                    output_tokens = data["usage"].get("completion_tokens", 0)
+                    self.total_tokens += input_tokens + output_tokens
+                
+                return result
         except Exception as e:
             raise RuntimeError(f"LM Studio complete failed: Are you sure the server is bridging to {self.base_url}? Error: {e}")
 
@@ -418,4 +628,5 @@ class LMStudioLLM(BaseLLM):
         except Exception:
             return False
 
-__all__ = ["BaseLLM", "OllamaLLM", "OpenAILLM", "AnthropicLLM", "OpenRouterLLM", "GeminiLLM", "LMStudioLLM"]
+__all__ = ["BaseLLM", "OllamaLLM", "OpenAILLM", "AnthropicLLM", "OpenRouterLLM", "GeminiLLM", "LMStudioLLM", 
+           "RateLimiter", "TokenCounter", "ProviderLimits"]

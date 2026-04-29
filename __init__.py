@@ -13,7 +13,7 @@ Usage:
     from nkit.agent import Agent, Step  # Direct from agent module
 """
 
-__version__ = "0.3.0"
+__version__ = "0.3.3"
 
 # Import from core modules
 from .agent import Agent, Step

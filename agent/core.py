@@ -295,6 +295,45 @@ class Agent:
             ```
         """
         return self.registry.decorator(name, desc)
+    
+    def get_session_stats(self) -> dict:
+        """Get statistics for the current session.
+        
+        Returns:
+            Dict with:
+            - session_id: Session UUID
+            - total_steps: Number of steps completed
+            - total_tokens: Total LLM tokens used (if provider supports tracking)
+            - total_cost: Estimated cost in USD (if provider supports tracking)
+            - memory_keys: Keys stored in memory
+        
+        Example:
+            ```python
+            result = agent.run("Find the capital of France")
+            stats = agent.get_session_stats()
+            print(f"Cost: ${stats['total_cost']:.4f}")
+            print(f"Tokens: {stats['total_tokens']}")
+            ```
+        """
+        llm_stats = {}
+        if hasattr(self.llm, 'get_token_stats'):
+            llm_stats = self.llm.get_token_stats()
+        elif callable(self.llm) and hasattr(self.llm, 'total_tokens'):
+            llm_stats = {
+                'total_tokens': getattr(self.llm, 'total_tokens', 0),
+                'total_cost': getattr(self.llm, 'total_cost', 0.0),
+            }
+        
+        return {
+            "session_id": self.session_id,
+            "reasoning_mode": self.reasoning_mode,
+            "llm_stats": llm_stats,
+            "memory_keys": list(self.memory.to_dict().keys()),
+            "tools_available": len(self.registry.tools),
+            "safety_gate_enabled": self.safety_gate is not None,
+            "observer_enabled": self.observer is not None,
+            "audit_trail_enabled": self.why_log is not None,
+        }
 
     def add_tool(self, name: str, func: Callable, desc: str = None) -> None:
         """Programmatically register a tool.
@@ -682,25 +721,29 @@ Please provide a valid JSON response as specified in the original prompt:
         try:
             # Check if event loop is running
             loop = asyncio.get_running_loop()
-            # If we get here, we're in an async context
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(asyncio.run, self.run_async(task))
-                return future.result()
         except RuntimeError:
             # No event loop running, safe to use asyncio.run
             return asyncio.run(self.run_async(task))
+        
+        # We have a running event loop, use executor to run asyncio.run in separate thread
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future = executor.submit(asyncio.run, self.run_async(task))
+            return future.result()
 
     def _run_pot_sync(self, task: str) -> str:
         """Execute PoT mode (plan once, execute deterministically)."""
         try:
             loop = asyncio.get_running_loop()
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(asyncio.run, self.run_pot_async(task))
-                return future.result()
         except RuntimeError:
+            # No event loop running, safe to use asyncio.run
             return asyncio.run(self.run_pot_async(task))
+        
+        # We have a running event loop, use executor to run asyncio.run in separate thread
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future = executor.submit(asyncio.run, self.run_pot_async(task))
+            return future.result()
 
     async def run_pot_async(self, task: str) -> str:
         """Execute task using Program of Thought (plan once).
